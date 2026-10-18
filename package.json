@@ -1,0 +1,9 @@
+{
+  "name": "van-brain",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/level-math.test.mjs",
+    "serve": "python -m http.server 8080"
+  }
+}
