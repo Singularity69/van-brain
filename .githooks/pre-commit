@@ -1,0 +1,91 @@
+#!/bin/sh
+# Pre-commit secret scan. Blocks a commit that adds an obvious key or a .env file.
+#   Turn it on once per clone:   git config core.hooksPath .githooks
+#   Uses gitleaks when it is installed, and always runs the built in pattern check below.
+#   A line that is safe on purpose (a test fixture, a public key) can carry the marker
+#   "secret-scan:allow" or "gitleaks:allow" to be skipped.
+#   Emergency only: git commit --no-verify (then fix it and rotate the key if it was real).
+# Plain POSIX sh, so it runs from Git for Windows, macOS and Linux.
+
+fail=0
+self=".githooks/pre-commit"
+
+say() { printf '%s\n' "$*" >&2; }
+
+# 1. gitleaks, when installed (newer releases use "git --pre-commit", older ones "protect").
+if command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks git --help >/dev/null 2>&1; then
+    gitleaks git --pre-commit --staged --redact --no-banner >&2 || fail=1
+  else
+    gitleaks protect --staged --redact --no-banner >&2 || fail=1
+  fi
+fi
+
+# 2. .env files. Blocked when the file name is .env, or when .gitignore ignores it and it was added anyway.
+for f in $(git diff --cached --name-only --diff-filter=ACR); do
+  base=${f##*/}
+  case "$base" in
+    .env.example|.env.sample|.env.template) continue ;;
+    .env)
+      say "Blocked: $f is an environment file. Keep keys in it out of Git (it should be in .gitignore)."
+      fail=1 ;;
+    .env.*)
+      if git check-ignore -q --no-index "$f" 2>/dev/null; then
+        say "Blocked: $f is ignored by .gitignore but was added anyway. Keys stay out of Git."
+        fail=1
+      fi ;;
+  esac
+done
+
+# 3. Built in patterns, on added lines only. Each line goes out as file<TAB>text.
+added=$(git diff --cached --no-color -U0 --diff-filter=ACMR | awk -v self="$self" '
+  /^\+\+\+ / { f = substr($0, 7); next }
+  /^\+/ { if (f != self) print f "\t" substr($0, 2) }')
+
+if [ -n "$added" ]; then
+  scan() { # $1 label, $2 extended regex
+    hits=$(printf '%s\n' "$added" | grep -E -- "$2" | grep -v -E 'secret-scan:allow|gitleaks:allow' | cut -f1 | sort -u)
+    if [ -n "$hits" ]; then
+      say "Blocked: what looks like $1 in:"
+      printf '  %s\n' $hits >&2
+      fail=1
+    fi
+  }
+  scan "an Anthropic API key" 'sk-ant-[A-Za-z0-9_-]{20,}'
+  scan "a Stripe live key" '(sk|rk)_live_[A-Za-z0-9]{10,}'
+  scan "a Stripe webhook secret" 'whsec_[A-Za-z0-9]{20,}'
+  scan "an AWS access key" '(AKIA|ASIA)[0-9A-Z]{16}'
+  scan "a private key block" '-----BEGIN ([A-Z]+ )*PRIVATE KEY( BLOCK)?-----'
+  scan "a GitHub token" '(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}'
+  scan "a Supabase secret key" 'sb_secret_[A-Za-z0-9_-]{20,}'
+  scan "a Resend API key" 're_[A-Za-z0-9]{8}_[A-Za-z0-9]{16,}'
+
+  # Supabase service role keys are JWTs whose payload says "role":"service_role". Public anon keys are
+  # JWTs too, so each token's payload is decoded and only service role ones are blocked.
+  jwts=$(printf '%s\n' "$added" | grep -v -E 'secret-scan:allow|gitleaks:allow' |
+    grep -o -E 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' | sort -u)
+  for t in $jwts; do
+    p=$(printf '%s' "$t" | cut -d. -f2 | tr '_-' '/+')
+    case $(( ${#p} % 4 )) in 2) p="$p==" ;; 3) p="$p=" ;; esac
+    if command -v base64 >/dev/null 2>&1; then
+      body=$(printf '%s' "$p" | base64 -d 2>/dev/null)
+    else
+      body="service_role" # cannot decode here, so be safe
+    fi
+    case "$body" in
+      *service_role*)
+        say "Blocked: a Supabase service role key (a JWT with role service_role)."
+        fail=1 ;;
+    esac
+  done
+  # A service role key assigned by name, whatever its format.
+  scan "a service role key assignment" '(SERVICE_ROLE|SERVICE_KEY|SECRET_KEY)[A-Z_]*["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?(eyJ|sb_secret_)[A-Za-z0-9_.-]{20,}'
+fi
+
+if [ "$fail" -ne 0 ]; then
+  say ""
+  say "Commit stopped by the secret scan. Move the key to a secret store (Worker or Supabase secrets,"
+  say "or a gitignored .env), unstage the file, and commit again. If a real key was ever committed, rotate it."
+  exit 1
+fi
+exit 0
